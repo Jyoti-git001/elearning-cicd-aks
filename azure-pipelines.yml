@@ -1,0 +1,170 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  acrName: $(ACR_NAME)
+  aksCluster: $(AKS_CLUSTER)
+  resourceGroup: $(RESOURCE_GROUP)
+  imageTag: $(Build.SourceVersion)
+
+stages:
+
+# ─────────────────────────────────────────────
+# STAGE 1: Build
+# ─────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build Docker Images'
+  jobs:
+  - job: BuildImages
+    displayName: 'Build & Push to ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Frontend Image'
+      inputs:
+        containerRegistry: 'ACRServiceConnection'
+        repository: 'elearning-frontend'
+        command: 'build'
+        Dockerfile: 'frontend/Dockerfile'
+        tags: |
+          $(imageTag)
+          latest
+
+    - task: Docker@2
+      displayName: 'Build Backend Image'
+      inputs:
+        containerRegistry: 'ACRServiceConnection'
+        repository: 'elearning-backend'
+        command: 'build'
+        Dockerfile: 'backend/Dockerfile'
+        tags: |
+          $(imageTag)
+          latest
+
+    - task: Docker@2
+      displayName: 'Push Frontend to ACR'
+      inputs:
+        containerRegistry: 'ACRServiceConnection'
+        repository: 'elearning-frontend'
+        command: 'push'
+        tags: |
+          $(imageTag)
+          latest
+
+    - task: Docker@2
+      displayName: 'Push Backend to ACR'
+      inputs:
+        containerRegistry: 'ACRServiceConnection'
+        repository: 'elearning-backend'
+        command: 'push'
+        tags: |
+          $(imageTag)
+          latest
+
+# ─────────────────────────────────────────────
+# STAGE 2: Test
+# ─────────────────────────────────────────────
+- stage: Test
+  displayName: 'Run Tests'
+  dependsOn: Build
+  jobs:
+  - job: RunTests
+    displayName: 'Unit & Integration Tests'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        pip install pytest pytest-cov requests
+        pytest tests/ --cov=. --cov-report=xml --cov-fail-under=70 -v
+      displayName: 'Run pytest with coverage'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results.xml'
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish Coverage Report'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '**/coverage.xml'
+
+# ─────────────────────────────────────────────
+# STAGE 3: Deploy to Staging
+# ─────────────────────────────────────────────
+- stage: DeployStaging
+  displayName: 'Deploy to Staging'
+  dependsOn: Test
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: StagingDeploy
+    displayName: 'Deploy to AKS Staging'
+    environment: 'staging'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to Staging Namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKSServiceConnection'
+              namespace: 'staging'
+              manifests: |
+                kubernetes/frontend-deployment.yaml
+                kubernetes/backend-deployment.yaml
+                kubernetes/services.yaml
+              containers: |
+                $(acrName).azurecr.io/elearning-frontend:$(imageTag)
+                $(acrName).azurecr.io/elearning-backend:$(imageTag)
+
+          - script: python scripts/smoke_test.py --env staging
+            displayName: 'Run Smoke Tests'
+
+# ─────────────────────────────────────────────
+# STAGE 4: Deploy to Production
+# ─────────────────────────────────────────────
+- stage: DeployProduction
+  displayName: 'Deploy to Production'
+  dependsOn: DeployStaging
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: ProductionDeploy
+    displayName: 'Deploy to AKS Production'
+    environment: 'production'   # Manual approval gate configured in Azure DevOps
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to Production Namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'AKSServiceConnection'
+              namespace: 'production'
+              manifests: |
+                kubernetes/frontend-deployment.yaml
+                kubernetes/backend-deployment.yaml
+                kubernetes/services.yaml
+                kubernetes/hpa.yaml
+              containers: |
+                $(acrName).azurecr.io/elearning-frontend:$(imageTag)
+                $(acrName).azurecr.io/elearning-backend:$(imageTag)
+
+          - script: python scripts/smoke_test.py --env production
+            displayName: 'Post-Deploy Smoke Test'
